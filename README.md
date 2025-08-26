@@ -31,7 +31,9 @@ The analysis focuses on:
 -   **Variables**: 67 predictors + 1 target (violent crime rate)  
 -   **Target**: `ViolentCrimesPerPop` (per capita violent crimes)
 
-![](figures/ResponseVarDist.png)
+  <p align="center">
+  <img src="figures/ResponseVarDist.png" width="500">
+  </p>
 
 Predictors include:
 
@@ -53,8 +55,12 @@ Predictors include:
     -   Handled via **Multiple Imputation by Chained Equations
         (MICE)**  
     -   Example trace & density plots:  
-        ![](results/figures/mice_trace.png)  
-        ![](results/figures/mice_density.png)
+        <p align="center">
+         <img src="figures/missing.png" width="500">
+          </p> 
+       <p align="center">
+      <img src="figures/Mice1.png" width="500">
+      </p>
 3.  **Multicollinearity**
     -   Variance Inflation Factor (VIF) analysis  
     -   Removed highly collinear variables
@@ -79,14 +85,22 @@ Predictors include:
     -   **Urbanization × Density × Transit**: transit protective in
         low-urban areas, less effective in dense cores.
 
-![](results/figures/gam_effects.png)
+  <p align="center">
+  <img src="figures/Q3.png" width="500">
+  </p> 
+
+  <p align="center">
+  <img src="figures/Q4.png" width="500">
+  </p>
 
 -   **Predictive Model**: Final GAM explained \~68% of variance with
     good accuracy:
     -   RMSE ≈ 0.136  
     -   MAE ≈ 0.08
 
-![](results/figures/predicted_vs_actual.png)
+  <p align="center">
+  <img src="figures/pred.png" width="500">
+  </p>
 
 ------------------------------------------------------------------------
 
