@@ -1,0 +1,1202 @@
+---
+title: "Project2"
+author: "Swati"
+date: "2025-06-04"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r, include=FALSE}
+library(tidyverse)
+library(naniar)
+library(pander)
+library(ggplot2)
+library(psych)
+library(dplyr)
+library(glmnet)
+library(MASS)
+library(pls)
+library(car)
+library(VIM)
+library(leaps)
+library(mice)
+library(ape)
+library(mgcv)
+library(miselect)
+library(lmtest)
+library(foreach)
+library(doParallel)
+library(olsrr)
+library(interactions)
+library(cluster)
+library(miceadds)
+library(car)
+library(future.apply)
+```
+
+Data Loading
+```{r, include=FALSE}
+data <- read.csv("UScrime2.csv", header = TRUE, stringsAsFactors = FALSE)
+summary(data)
+dim(data)
+```
+
+```{r, echo=FALSE}
+data$state <- as.factor(data$state)
+
+# Create a data frame of state counts
+state_counts <- as.data.frame(table(data$state))
+colnames(state_counts) <- c("State", "Count")
+
+# Reorder factor levels so barplot is sorted by count
+state_counts$State <- reorder(state_counts$State, -state_counts$Count)
+
+# Plot
+ggplot(state_counts, aes(x = State, y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Communities per State",
+       x = "State",
+       y = "Number of Communities") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+Removing unnecessary columns
+```{r, echo=FALSE, include=FALSE}
+data <- subset(data, select = -c(state,communityname))
+str(data)
+```
+
+EDA
+```{r, echo=FALSE}
+missing_summary <- colSums(is.na(data))
+missing_summary_filtered <- missing_summary[missing_summary > 0]
+pander(missing_summary_filtered)
+```
+
+```{r, echo=FALSE}
+ggplot(data, aes(x=ViolentCrimesPerPop)) +
+  geom_histogram(binwidth=0.02, fill="skyblue", color="black") +
+  labs(title="Distribution of ViolentCrimesPerPop", x="Violent Crimes Per Population", y="Count")
+```
+
+```{r, echo=FALSE}
+library(corrplot)
+# Compute the full correlation matrix first
+numeric_data <- data[sapply(data, is.numeric)]
+cor_matrix <- cor(numeric_data, use="pairwise.complete.obs")
+
+# Now extract the row corresponding to ViolentCrimesPerPop
+cor_target <- cor_matrix["ViolentCrimesPerPop", ]
+
+# Sort by absolute correlation values
+cor_target_sorted <- sort(abs(cor_target), decreasing=TRUE)
+
+# Get top 20 variables (excluding self-correlation)
+top_vars <- names(cor_target_sorted)[2:10]
+
+# Include ViolentCrimesPerPop in the top_vars
+top_vars <- c("ViolentCrimesPerPop", top_vars)
+
+# Compute correlation matrix for the top variables
+cor_top <- cor(numeric_data[, top_vars], use="pairwise.complete.obs")
+
+# Plot with adjusted margins and sizes
+par(mar = c(1, 1, 1, 1))
+corrplot(cor_top,
+         method = "color",
+         type = "lower",
+         tl.cex = 0.6,
+         tl.col = "black",
+         addCoef.col = "white",
+         number.cex = 0.5,
+         diag = FALSE)
+
+top_data <- numeric_data[, top_vars]
+
+# Now pass that to pairs.panels
+pairs.panels(top_data,
+             method = "spearman", # correlation method
+             hist.col = "lightgreen", # histogram color
+             density = TRUE,  # show density plots
+             ellipses = FALSE # do not show correlation ellipses
+)
+```
+
+MICE
+```{r, echo=FALSE}
+missing_counts <- colSums(is.na(data))
+
+# Filter only columns with missing values
+missing_counts <- missing_counts[missing_counts > 0]
+
+# Convert to data frame for table
+missing_table <- data.frame(
+  Predictor = names(missing_counts),
+  Missing_Count = as.vector(missing_counts)
+)
+
+# Print table using pander
+pander(missing_table)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+missing_vars <- names(data)[colSums(is.na(data)) > 0]
+vars_to_check <- c(missing_vars)
+gg_miss_upset(data[ , vars_to_check])
+```
+```{r, echo=FALSE, warning=FALSE}
+#imp <- mice(data, print = FALSE)
+
+imp <- mice(data, 
+            m = 5,          # Number of multiple imputations
+            maxit = 12,     # Number of iterations
+            seed = 123,     # For reproducibility
+            print = FALSE) 
+plot(imp)
+```
+```{r, echo=FALSE}
+densityplot(imp, ~medIncome + PctEmploy + MedYrHousBuilt + PctPopUnderPov)
+```
+```{r,  echo=FALSE}
+for (i in 1:5) {
+  d <- complete(imp, i)
+  m <- lm(ViolentCrimesPerPop ~ ., data = d)
+}
+```
+
+Removing Correlated Variables
+```{r, echo=FALSE}
+vif_values <- lapply(1:5, function(i) {
+  completed_data <- complete(imp, i)
+  fit <- lm(ViolentCrimesPerPop ~ ., data=completed_data)
+  vif(fit)
+})
+
+# Average VIFs across imputations
+vif_matrix <- do.call(rbind, vif_values)
+mean_vif <- colMeans(vif_matrix, na.rm=TRUE)
+
+high_vif_df <- data.frame(
+  Variable = names(mean_vif[mean_vif > 10]),
+  Mean_VIF = round(mean_vif[mean_vif > 10], 2),
+  row.names = NULL
+)
+
+n_collinear <- sum(mean_vif > 10)
+
+# Print the result
+cat("Number of variables with high multicollinearity (VIF > 10):", n_collinear, "\n")
+```
+
+\newpage
+```{r, echo=FALSE}
+
+# Nicely formatted output
+pander(high_vif_df, caption = "Variables with High Multicollinearity (Mean VIF > 10)")
+```
+```{r, echo=FALSE}
+# Initialize list to store results
+retained_vars_list <- list()
+removed_vars_list <- list()
+
+# Set threshold
+vif_threshold <- 10
+
+# Loop over all 5 imputed datasets
+for (i in 1:5) {
+  d <- complete(imp, i)
+  
+  predictors <- setdiff(names(d), "ViolentCrimesPerPop")
+  removed_vars <- c()
+  
+  repeat {
+    # Fit linear model
+    form <- as.formula(paste("ViolentCrimesPerPop ~", paste(predictors, collapse = " + ")))
+    model <- lm(form, data = d)
+    
+    # Calculate adjusted VIFs
+    vif_vals <- vif(model)
+    adj_vif <- if (is.matrix(vif_vals)) vif_vals[, "GVIF^(1/(2*Df))"] else vif_vals
+    
+    if (all(adj_vif < vif_threshold)) break
+    
+    var_to_remove <- names(which.max(adj_vif))
+    predictors <- setdiff(predictors, var_to_remove)
+    removed_vars <- c(removed_vars, var_to_remove)
+  }
+  
+  retained_vars_list[[i]] <- predictors
+  removed_vars_list[[i]] <- removed_vars
+}
+
+removed_intersection <- Reduce(intersect, removed_vars_list)
+vif_summary <- data.frame(
+  Removed_Variables = removed_intersection,
+  stringsAsFactors = FALSE
+)
+```
+
+\newpage
+
+```{r, echo=FALSE}
+# Print removed variables in table format
+pander(vif_summary, caption = "Variables Consistently Removed Across All 5 Imputed Datasets (VIF > 10)")
+
+retained_counts <- sapply(retained_vars_list, length)
+
+# Create and print summary table
+retained_df <- data.frame(
+  Dataset = paste0("Imputation ", 1:5),
+  Retained_Variables = retained_counts
+)
+
+pander(retained_df, caption = "Number of Variables Retained After VIF Filtering (Per Imputed Dataset)")
+```
+```{r, echo=FALSE}
+final_vars <- Reduce(intersect, retained_vars_list)
+formula_str <- paste("ViolentCrimesPerPop ~", paste(final_vars, collapse = " + "))
+form <- as.formula(paste("ViolentCrimesPerPop ~", paste(final_vars, collapse = " + ")))
+model <- lm(form, data = d)
+par(mfrow = c(2, 2))
+plot(model)
+```
+```{r, echo=FALSE}
+ks_bp_summary <- data.frame(
+  Dataset = character(),
+  `KS D` = numeric(),
+  `KS p-value` = character(),
+  `BP Statistic` = numeric(),
+  `BP df` = integer(),
+  `BP p-value` = character(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through imputations
+for (i in 1:5) {
+  d <- complete(imp, i)
+  model <- lm(form, data = d)
+  
+  # KS Test
+  ks <- ks.test(model$residuals, "pnorm", mean(model$residuals), sd(model$residuals))
+  ks_pval <- ifelse(ks$p.value < 2.2e-16, "< 2.2e-16", formatC(ks$p.value, digits=4, format="e"))
+  
+  # BP Test
+  bp <- bptest(model)
+  bp_pval <- ifelse(bp$p.value < 2.2e-16, "< 2.2e-16", formatC(bp$p.value, digits=4, format="e"))
+  
+  # Add to summary
+  ks_bp_summary <- rbind(ks_bp_summary, data.frame(
+    Dataset = paste("Imputation", i),
+    `KS D` = round(ks$statistic, 5),
+    `KS p-value` = ks_pval,
+    `BP Statistic` = round(bp$statistic, 2),
+    `BP df` = bp$parameter,
+    `BP p-value` = bp_pval
+  ))
+}
+
+# Nicely format using pander
+pander(ks_bp_summary, caption = "KS and Breusch-Pagan Test Results Across Imputed Datasets")
+```
+```{r, echo=FALSE}
+ks_bp_summary <- NULL
+ks_bp_summary <- data.frame(
+  Dataset = character(),
+  `KS D` = numeric(),
+  `KS p-value` = character(),
+  `BP Statistic` = numeric(),
+  `BP df` = integer(),
+  `BP p-value` = character(),
+  stringsAsFactors = FALSE
+)
+form_log <- as.formula(paste("log(ViolentCrimesPerPop + 0.01) ~", paste(final_vars, collapse = " + ")))
+for (i in 1:5) {
+  d <- complete(imp, i)
+  model <- lm(form_log, data = d)
+  # KS Test
+  ks <- ks.test(model$residuals, "pnorm", mean(model$residuals), sd(model$residuals))
+  ks_pval <- ifelse(ks$p.value < 2.2e-16, "< 2.2e-16", formatC(ks$p.value, digits=4, format="e"))
+  
+  # BP Test
+  bp <- bptest(model)
+  bp_pval <- ifelse(bp$p.value < 2.2e-16, "< 2.2e-16", formatC(bp$p.value, digits=4, format="e"))
+  
+  # Add to summary
+  ks_bp_summary <- rbind(ks_bp_summary, data.frame(
+    Dataset = paste("Imputation", i),
+    `KS D` = round(ks$statistic, 5),
+    `KS p-value` = ks_pval,
+    `BP Statistic` = round(bp$statistic, 2),
+    `BP df` = bp$parameter,
+    `BP p-value` = bp_pval
+  ))
+}
+par(mfrow = c(2, 2))
+plot(model)
+# Nicely format using pander
+pander(ks_bp_summary, caption = "KS and Breusch-Pagan Test Results Across Imputed Datasets with Log transform of Y")
+```
+
+```{r, echo=FALSE}
+form_gam <- as.formula(
+  paste("log(ViolentCrimesPerPop + 0.01) ~", 
+        paste(paste0("s(", final_vars, ")"), collapse = " + "))
+)
+```
+
+
+```{r, echo=FALSE, eval=FALSE}
+for (i in 1:1) {
+  d <- complete(imp, i)
+  
+  # Fit GAM
+  model <- gam(form_gam, data = d, method = "REML")
+  
+} 
+par(mfrow = c(2, 2))
+gam.check(model)
+mtext(paste("GAM Diagnostics - Imputed Dataset"), outer = TRUE, line = -1.5, cex = 1.2)
+```
+
+```{r, echo=FALSE}
+cl <- makeCluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# Define formula and data
+form_log <- as.formula(paste("log(ViolentCrimesPerPop + 0.01) ~", paste(final_vars, collapse = " + ")))
+d <- complete(imp, 1)
+
+# Run regsubsets (sequential, but fast and lightweight)
+subset_fit <- regsubsets(form_log, data = d, nvmax = length(final_vars))
+
+# Get model stats
+subset_summary <- summary(subset_fit)
+
+# Stop cluster
+stopCluster(cl)
+```
+
+
+```{r, echo=FALSE}
+par(mfrow=c(2,2))
+ plot(subset_summary$adjr2,xlab="Number of Variables",ylab="Adjusted RSq",type="l")
+ plot(subset_summary$cp,xlab="Number of Variables",ylab="Cp",type='l')
+ plot(subset_summary$bic,xlab="Number of Variables",ylab="BIC",type='l')
+```
+
+```{r, echo=FALSE}
+pander( c(best_adjrsq=which.max(subset_summary$adjr2),
+ best_cp=which.min(subset_summary$cp),
+ best_bic=which.min(subset_summary$bic)))
+```
+
+```{r, echo=FALSE}
+vars_cp <- names(which(subset_summary$which[25, ]))[-1]  # Remove intercept
+form_cp <- as.formula(
+  paste("log(ViolentCrimesPerPop + 0.01) ~", paste(vars_cp, collapse = " + "))
+)
+
+d <- complete(imp, 1)  # Use first imputed dataset
+model_cp <- lm(form_cp, data = d)
+```
+
+```{r, echo=FALSE, eval=FALSE}
+form_cp_lm <- as.formula(
+  paste("log(ViolentCrimesPerPop + 0.01) ~", paste(vars_cp, collapse = " + "))
+)
+
+fit_lm <- gam(form_cp_lm, data = complete(imp, 2), method = "REML")
+
+form_cp_gam <- as.formula(
+  paste("log(ViolentCrimesPerPop + 0.01) ~", 
+        paste(paste0("s(", vars_cp, ")"), collapse = " + "))
+)
+
+fit_gam <- gam(form_cp_gam, data = complete(imp, 2), method = "REML")
+pander(AIC(fit_lm, fit_gam), caption="")
+pander(BIC(fit_lm, fit_gam), caption="")
+lm.adjrsq<-summary(fit_lm)$r.sq
+gam.adjrsq<-summary(fit_gam)$r.sq
+
+##Create and print dataframe of adjusted R^2 values
+modname<-c("Linear model", "GAM")
+adj.rsq<-c(lm.adjrsq,gam.adjrsq)
+rsq<-data.frame(modname,adj.rsq)
+names(rsq)<-c("Model",  "Adjusted Rsq")
+pander(rsq, caption="", digits=3)
+```
+```{r, echo=FALSE, warning=FALSE, eval=FALSE}
+cl <- makeCluster(parallel::detectCores() - 1)  # leave one core free
+registerDoParallel(cl)
+
+# Step 2: Parallel GAM fitting across imputations
+gam_list <- foreach(i = 1:imp$m, .packages = c("mgcv", "mice")) %dopar% {
+  d <- complete(imp, i)
+  d$log_crime <- log(d$ViolentCrimesPerPop + 0.01)
+
+  # Correct formula string
+  smooth_terms <- paste0("s(", vars_cp, ")")
+  form_gam <- as.formula(paste("log_crime ~", paste(smooth_terms, collapse = " + ")))
+
+  gam(form_gam, data = d, method = "REML")
+}
+
+# Step 3: Stop cluster
+stopCluster(cl)
+```
+
+\newpage
+```{r, echo=FALSE, eval=FALSE}
+s_tables <- lapply(gam_list, function(model) summary(model)$s.table)
+n_models <- length(s_tables)
+term_names <- rownames(s_tables[[1]])
+n_terms <- length(term_names)
+
+# Extract each metric across imputations
+edf_mat <- sapply(s_tables, function(st) st[, "edf"])
+f_mat   <- sapply(s_tables, function(st) st[, "F"])
+p_mat   <- sapply(s_tables, function(st) st[, "p-value"])
+
+# Rubin-style pooling for F-values and p-values
+edf_pooled <- rowMeans(edf_mat)       # Just average EDFs
+f_pooled   <- rowMeans(f_mat)         # Average F-statistics
+
+p_pooled   <- apply(p_mat, 1, median)
+
+pooled_smooth <- data.frame(
+  Term = term_names,
+  EDF = round(edf_pooled, 2),
+  F = round(f_pooled, 2),
+  `P-value` = signif(p_pooled, 3)
+)
+
+pander(pooled_smooth, row.names = FALSE)
+```
+
+
+```{r, echo = FALSE, eval=FALSE}
+# Extract deviance explained
+sapply(gam_list, function(model) summary(model)$dev.expl)
+
+# Extract EDF for each variable
+lapply(gam_list, function(model) summary(model)$s.table)
+```
+
+
+```{r, echo=FALSE, eval=FALSE}
+par(mfrow = c(2,3))
+plot(gam_list[[1]], pages = 0, shade = TRUE)
+```
+```{r, echo = FALSE, eval=FALSE}
+pdf("gam_plots.pdf", width = 10, height = 6)
+
+# Set up for 6 plots per page
+n_plots <- length(gam_list[[1]]$smooth)
+plots_per_page <- 6
+
+for (i in seq_len(n_plots)) {
+  # Start a new page every 6 plots
+  if ((i - 1) %% plots_per_page == 0) {
+    par(mfrow = c(2, 3))  # Reset layout for new page
+  }
+  plot(gam_list[[1]], select = i, shade = TRUE, main = paste("Smooth Term", i))
+}
+
+dev.off()
+```
+
+
+Question: 2
+
+Do communities with high unemployment (PctUnemployed) and high housing vacancy rates (PctVacMore6Mos) experience increases in violent crime?
+
+```{r, echo=FALSE}
+vars_a <- c(vars_cp, "PctUnemployed")
+form_gam_a <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_a, ")", collapse = " + "),
+  "+ te(PctUnemployed, PctVacMore6Mos)"
+))
+
+gam_model_a <- gam(form_gam_a, data = d, method = "REML")
+```
+```{r, echo= FALSE}
+gam_sum <- summary(gam_model_a)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(PctUnemployed)", "s(PctVacMore6Mos)", "te(PctUnemployed,PctVacMore6Mos)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: PctUnemployed, PctVacMore6Mos and their Interaction")
+```
+```{r, echo = FALSE}
+library(ggplot2)
+
+# Assuming you're working with one completed dataset
+d <- complete(imp, 1)
+
+ggplot(d, aes(x = PctUnemployed, y = PctVacMore6Mos)) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", contour = TRUE, alpha = 0.5) +
+  geom_point(alpha = 0.4, size = 1) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Joint Density: PctUnemployed vs PctVacMore6Mos",
+    x = "Percent Unemployed",
+    y = "Percent Vacant > 6 Months"
+  ) +
+  theme_minimal()
+
+```
+
+Question: 3
+Does the impact of youth presence (e.g., percent of older children and young adults, percent of teens in two-parent households) on violent crime rates vary depending on the size and density of households in a community? [agePct12t21, PctTeen2Par---PctLargHouseFam, PersPerOwnOccHous]
+
+```{r, echo = FALSE}
+vars_b <- c(vars_cp, "householdsize", "agePct12t21")
+form_gam_b <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_b, ")", collapse = " + "),
+  "+ te(agePct12t21, householdsize)"
+))
+
+gam_model_b <- gam(form_gam_b, data = d, method = "REML")
+summary(gam_model_b)
+```
+```{r, echo=FALSE}
+gam_sum <- summary(gam_model_b)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(agePct12t21)", "s(householdsize)", "te(agePct12t21,householdsize)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: agePct12t21, householdsize and their Interaction")
+```
+```{r, echo = FALSE}
+# 3D perspective plot
+vis.gam(gam_model_b, 
+        view = c("agePct12t21", "householdsize"), 
+        plot.type = "persp", 
+        color = "topo", 
+        theta = 35, phi = 30,
+        main = "Interaction: Youth Presence × Household Size")
+```
+
+
+```{r, echo = FALSE}
+# Optional: contour plot version
+vis.gam(gam_model_b, 
+        view = c("agePct12t21", "householdsize"), 
+        plot.type = "contour", 
+        color = "terrain",
+        main = "Contour: Youth Presence × Household Size")
+
+```
+Question 4: Do poor infrastructure indicators (PctWOFullPlumb, PctHousNoPhone) magnify the crime risk posed by low residential stability ( PctSameCity85)?
+
+```{r, echo = FALSE}
+vars_c <- c(vars_cp, "PctSameCity85")
+form_gam_c <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_c, ")", collapse = " + "),
+  "+ te(PctSameCity85, PctHousNoPhone)",
+  "+ te(PctSameCity85,PctWOFullPlumb)"
+))
+
+gam_model_c <- gam(form_gam_c, data = d, method = "REML")
+summary(gam_model_c)
+```
+
+```{r, echo = FALSE}
+gam_sum <- summary(gam_model_c)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(PctHousNoPhone)", "s(PctWOFullPlumb)" ,"s(PctSameCity85)","te(PctSameCity85,PctHousNoPhone)" ,"te(PctSameCity85,PctWOFullPlumb)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: PctHousNoPhone, PctWOFullPlumb, PctSameCity85 and their Interaction")
+```
+
+```{r, warning=FALSE, echo = FALSE}
+vis.gam(
+  gam_model_c,
+  view = c("PctSameCity85", "PctHousNoPhone"),
+  plot.type = "contour",
+  color = "terrain",
+  main = "Interaction: Stability × Phone Access"
+)
+```
+Question 5: Is there a cumulative effect of disadvantages (low education and high Unemployment) on crime rates beyond their individual effects?
+
+```{r, echo = FALSE}
+vars_d <- c(vars_cp, "PctNotHSGrad", "PctUnemployed")
+form_gam_d <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_d, ")", collapse = " + "),
+  "+ te(PctNotHSGrad, PctUnemployed)"
+))
+
+gam_model_d <- gam(form_gam_d, data = d, method = "REML")
+summary(gam_model_d)
+```
+
+```{r, echo = FALSE}
+gam_sum <- summary(gam_model_d)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(PctNotHSGrad)" ,"s(PctUnemployed)","te(PctNotHSGrad,PctUnemployed)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: PctNotHSGrad, PctUnemployed and their Interaction")
+```
+
+```{r, warning=FALSE, echo = FALSE}
+vis.gam(
+  gam_model_d,
+  view = c("PctNotHSGrad", "PctUnemployed"),
+  plot.type = "contour",
+  color = "terrain",
+  main = "Interaction: Low Education × Unemployment"
+)
+```
+
+```{r, echo = FALSE}
+library(ggplot2)
+
+d <- complete(imp, 1)
+
+# Replace 'crime_data' with your dataset name
+ggplot(d, aes(x = PctNotHSGrad, y = PctUnemployed)) +
+  stat_density_2d(aes(fill = ..level..), geom = "polygon", contour = TRUE) +
+  geom_point(alpha = 0.4, size = 1) +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Joint Density: % Without High School Diploma vs. % Unemployed",
+    x = "PctNotHSGrad (Low Education)",
+    y = "PctUnemployed"
+  ) +
+  theme_minimal()
+```
+```{r, echo = FALSE}
+table(
+  cut(d$PctNotHSGrad, breaks = 3),
+  cut(d$PctUnemployed, breaks = 3)
+)
+```
+
+Question 6 Are communities with higher urbanization (pctUrban) and population density (PopDens) more prone to violent crime, and does this relationship change with access to public transit (PctUsePubTrans)? - Does the impact of population density on violent crime vary depending on access to public transportation?
+```{r, echo = FALSE}
+vars_e <- c(vars_cp, "PctUsePubTrans")
+form_gam_e <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_e, ")", collapse = " + "),
+  "+ te(pctUrban, PctUsePubTrans, PopDens)"
+))
+
+gam_model_e <- gam(form_gam_e, data = d, method = "REML")
+summary(gam_model_e)
+```
+
+```{r, echo = FALSE}
+gam_sum <- summary(gam_model_e)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(pctUrban)", "s(PopDens)" ,"s(PctUsePubTrans)","te(pctUrban,PctUsePubTrans,PopDens)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: pctUrban, PopDens, PctUsePubTrans and their Interaction")
+```
+```{r, warning=FALSE, echo = FALSE}
+vis.gam(gam_model_e,
+        view = c("PopDens", "PctUsePubTrans"),
+        cond = list(pctUrban = 0.2),
+        plot.type = "contour",
+        color = "terrain",
+        main = "Interaction Slice: pctUrban = 0.2 (Low Urbanization)")
+
+# Medium urbanization (50%)
+vis.gam(gam_model_e,
+        view = c("PopDens", "PctUsePubTrans"),
+        cond = list(pctUrban = 0.5),
+        plot.type = "contour",
+        color = "terrain",
+        main = "Interaction Slice: pctUrban = 0.5 (Medium Urbanization)")
+
+# High urbanization (80%)
+vis.gam(gam_model_e,
+        view = c("PopDens", "PctUsePubTrans"),
+        cond = list(pctUrban = 0.8),
+        plot.type = "contour",
+        color = "terrain",
+        main = "Interaction Slice: pctUrban = 0.8 (High Urbanization)")
+```
+
+Question 7
+
+Do income-related measures affect crime directly, or are their effects mediated by housing quality and access?
+
+
+```{r, echo = FALSE}
+# Income-related variables
+income_vars <- c(vars_cp, "medIncome", "perCapInc", "PctPopUnderPov", 
+                 "pctWPubAsst", "MedRentPctHousInc", "pctWFarmSelf")
+
+# Housing-related variables
+housing_vars <- c(vars_cp, "PctVacantBoarded", "PctVacMore6Mos", "OwnOccHiQuart", 
+                  "PctWOFullPlumb", "PctSameHouse85", "MedRent")
+
+```
+
+```{r, echo = FALSE}
+# Model A: Income-only
+form_income <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", income_vars, ")", collapse = " + ")
+))
+gam_income <- gam(form_income, data = d, method = "REML")
+
+# Model B: Housing-only
+form_housing <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", housing_vars, ")", collapse = " + ")
+))
+gam_housing <- gam(form_housing, data = d, method = "REML")
+
+# Model C: Combined (Income + Housing)
+form_combined <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", c(income_vars, housing_vars), ")", collapse = " + ")
+))
+gam_combined <- gam(form_combined, data = d, method = "REML")
+```
+
+```{r, echo = FALSE}
+summary(gam_housing)
+```
+
+```{r, echo = FALSE}
+income_vars <- c("medIncome", "perCapInc", "PctPopUnderPov", 
+                 "pctWPubAsst", "MedRentPctHousInc", "pctWFarmSelf")
+
+housing_vars <- c("PctVacantBoarded", "PctVacMore6Mos", "OwnOccHiQuart", 
+                  "PctWOFullPlumb", "PctSameHouse85", "MedRent")
+
+
+# Convert to s(term) format to match rownames in summary
+s_income_terms <- paste0("s(", income_vars, ")")
+s_housing_terms <- paste0("s(", housing_vars, ")")
+all_terms <- unique(c(s_income_terms, s_housing_terms))
+
+income_tbl <- as.data.frame(summary(gam_income)$s.table)
+income_tbl$Term <- rownames(income_tbl)
+income_tbl <- income_tbl[income_tbl$Term %in% all_terms, ]
+colnames(income_tbl)[1:4] <- c("edf_income", "Ref.df_income", "F_income", "pval_income")
+
+housing_tbl <- as.data.frame(summary(gam_housing)$s.table)
+housing_tbl$Term <- rownames(housing_tbl)
+housing_tbl <- housing_tbl[housing_tbl$Term %in% all_terms, ]
+colnames(housing_tbl)[1:4] <- c("edf_housing", "Ref.df_housing", "F_housing", "pval_housing")
+
+combined_tbl <- as.data.frame(summary(gam_combined)$s.table)
+combined_tbl$Term <- rownames(combined_tbl)
+combined_tbl <- combined_tbl[combined_tbl$Term %in% all_terms, ]
+colnames(combined_tbl)[1:4] <- c("edf_combined", "Ref.df_combined", "F_combined", "pval_combined")
+
+# Merge
+
+comparison_table <- full_join(income_tbl, housing_tbl, by = "Term") |>
+                    full_join(combined_tbl, by = "Term")
+
+# Rearranged for readability
+library(dplyr)
+
+dplyr::select(comparison_table, Term,
+              edf_income, F_income, pval_income,
+              edf_housing, F_housing, pval_housing,
+              edf_combined, F_combined, pval_combined)
+
+# View the filtered comparison
+pander(comparison_table)
+```
+
+
+
+```{r, echo = FALSE}
+pander(AIC(gam_income, gam_housing, gam_combined))
+pander(c(
+  Income_Only = summary(gam_income)$dev.expl,
+  Housing_Only = summary(gam_housing)$dev.expl,
+  Combined = summary(gam_combined)$dev.expl
+))
+```
+```{r, echo = FALSE}
+par(mfrow = c(1, 2), mar = c(5, 5, 2, 2))
+
+# Plot for Poverty
+plot(gam_income, select = 28, se = TRUE, shade = TRUE, main = "Effect of Poverty (Income Only)")
+plot(gam_combined, select = 28, se = TRUE, shade = TRUE, main = "Effect of Poverty (Adjusted)")
+
+# New layout for Per Capita Income
+par(mfrow = c(1, 2), mar = c(5, 5, 2, 2))
+
+plot(gam_income, select = 27, se = TRUE, shade = TRUE, main = "Effect of PCIncome (Income Only)")
+plot(gam_combined, select = 27, se = TRUE, shade = TRUE, main = "Effect of PCIncome (Adjusted)")
+```
+
+Question 8: Does the effect of housing age on violent crime vary depending on residential stability — i.e., the percentage of people living in the same house since 1985?
+```{r,echo = FALSE}
+vars_g <- c(vars_cp)
+form_gam_g <- as.formula(paste(
+  "log(ViolentCrimesPerPop + 0.01) ~", 
+  paste0("s(", vars_g, ")", collapse = " + "),
+  "+ te(MedYrHousBuilt, PctSameHouse85)"
+))
+
+gam_model_g <- gam(form_gam_g, data = d, method = "REML")
+summary(gam_model_g)
+```
+
+```{r, echo = FALSE}
+gam_sum <- summary(gam_model_g)
+
+# Extract s.table
+smooth_terms <- as.data.frame(gam_sum$s.table)
+smooth_terms$Term <- rownames(gam_sum$s.table)
+rownames(smooth_terms) <- NULL
+
+# Reorder columns and clean up
+smooth_terms <- smooth_terms[, c("Term", "edf", "Ref.df", "F", "p-value")]
+smooth_terms$edf <- round(smooth_terms$edf, 3)
+smooth_terms$Ref.df <- round(smooth_terms$Ref.df, 3)
+smooth_terms$F <- round(smooth_terms$F, 3)
+smooth_terms$`p-value` <- signif(smooth_terms$`p-value`, 4)
+
+# Filter to just the three terms of interest
+focus_terms <- c("s(MedYrHousBuilt)" ,"s(PctSameHouse85)","te(MedYrHousBuilt,PctSameHouse85)")
+filtered_df <- subset(smooth_terms, Term %in% focus_terms)
+
+# Print as table
+pander(filtered_df, caption = "GAM Summary: MedYrHousBuilt, PctSameHouse85 and their Interaction")
+```
+
+```{r, warning=FALSE, echo = FALSE}
+vis.gam(
+  gam_model_g,
+  view = c("MedYrHousBuilt", "PctSameHouse85"),
+  plot.type = "contour",
+  color = "terrain",
+  main = "Housing Age × Residential Stability"
+)
+```
+PREDICTED MODEL:
+
+```{r, warning=FALSE, echo=FALSE}
+data <- read.csv("UScrime2.csv", header = TRUE, stringsAsFactors = FALSE)
+data <- subset(data, select = -c(communityname))
+imp <- mice(data, 
+            m = 5,          # Number of multiple imputations
+            maxit = 12,     # Number of iterations
+            seed = 123,     # For reproducibility
+            print = FALSE) 
+```
+```{r, echo=FALSE}
+completed_list <- lapply(1:5, function(i) {
+  d <- complete(imp, i)
+  d$log_crime <- log(d$ViolentCrimesPerPop + 0.01)
+  d
+})
+```
+
+```{r, echo=FALSE}
+set.seed(123)  # for reproducibility
+n <- nrow(data)
+train_idx <- sample(seq_len(n), size = 0.8 * n)
+# For testing:
+test_idx <- setdiff(seq_len(n), train_idx)
+
+train_list <- lapply(completed_list, function(df) df[train_idx, ])
+test_data  <- completed_list[[1]][test_idx, ] 
+vars_all<- names(data)
+vars_sc <- setdiff(vars_all, c("ViolentCrimesPerPop", "state"))
+```
+
+```{r, echo=FALSE}
+# Example: keep only variables with abs(correlation) > 0.1
+cor_vals <- sapply(vars_sc, function(v) cor(data[[v]], data$ViolentCrimesPerPop, use = "pairwise.complete.obs"))
+vars_filtered <- names(cor_vals)[abs(cor_vals) > 0.1]
+
+# Update formula
+gam_formula <- reformulate(
+  termlabels = c("state", paste0("s(", vars_filtered, ", k = 6)")),
+  response = "log_crime"
+)
+```
+
+
+```{r, eval=FALSE, include=FALSE}
+start_time <- Sys.time()
+model_test <- gam(gam_formula, data = train_list[[1]], method = "REML", select = TRUE)
+end_time <- Sys.time()
+
+round(difftime(end_time, start_time, units = "mins"), 2)
+summary(model_test)
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Predict on the test set (on log scale)
+log_pred <- predict(model_test, newdata = test_data)
+
+# Back-transform to original crime scale
+pred_crime <- exp(log_pred) - 0.01
+
+# True values
+true_crime <- test_data$ViolentCrimesPerPop
+
+# Create a comparison table
+prediction_results <- data.frame(
+  Community = test_data$state,  # or use rownames(test_data) if you prefer
+  True_Crime = round(true_crime, 2),
+  Predicted_Crime = round(pred_crime, 2)
+)
+
+pander(head(prediction_results))
+```
+
+```{r, eval=FALSE, include=FALSE}
+# RMSE
+rmse <- sqrt(mean((prediction_results$Predicted_Crime - prediction_results$True_Crime)^2))
+
+# MAE
+mae <- mean(abs(prediction_results$Predicted_Crime - prediction_results$True_Crime))
+
+# R²
+ss_res <- sum((prediction_results$True_Crime - prediction_results$Predicted_Crime)^2)
+ss_tot <- sum((prediction_results$True_Crime - mean(prediction_results$True_Crime))^2)
+r_squared <- 1 - ss_res / ss_tot
+
+cat("RMSE:", rmse, "\nMAE:", mae, "\nR-squared:", r_squared, "\n")
+
+```
+
+
+```{r, echo=FALSE}
+start_time <- Sys.time()
+gam_fits <- lapply(train_list, function(df) {
+  gam(gam_formula, data = df, method = "REML", select = TRUE)
+})
+end_time <- Sys.time()
+
+round(difftime(end_time, start_time, units = "mins"), 2)
+```
+
+```{r, echo=FALSE}
+s_tables <- lapply(gam_fits, function(model) summary(model)$s.table)
+n_models <- length(s_tables)
+term_names <- rownames(s_tables[[1]])
+n_terms <- length(term_names)
+
+# Extract each metric across imputations
+edf_mat <- sapply(s_tables, function(st) st[, "edf"])
+f_mat   <- sapply(s_tables, function(st) st[, "F"])
+p_mat   <- sapply(s_tables, function(st) st[, "p-value"])
+
+# Rubin-style pooling for F-values and p-values
+edf_pooled <- rowMeans(edf_mat)       # Just average EDFs
+f_pooled   <- rowMeans(f_mat)         # Average F-statistics
+
+p_pooled   <- apply(p_mat, 1, median)
+
+pooled_smooth <- data.frame(
+  Term = term_names,
+  EDF = round(edf_pooled, 3),
+  F = round(f_pooled, 3),
+  `P-value` = signif(p_pooled, 3)
+)
+
+pander(pooled_smooth, row.names = FALSE)
+
+```
+```{r, echo=FALSE}
+p_tables <- lapply(gam_fits, function(model) summary(model)$p.table)
+
+# Get parametric term names
+p_term_names <- rownames(p_tables[[1]])
+n_p_terms <- length(p_term_names)
+
+# Extract estimates, SE, t-values, p-values
+est_mat <- sapply(p_tables, function(pt) pt[, "Estimate"])
+se_mat  <- sapply(p_tables, function(pt) pt[, "Std. Error"])
+t_mat   <- sapply(p_tables, function(pt) pt[, "t value"])
+p_mat_p <- sapply(p_tables, function(pt) pt[, "Pr(>|t|)"])
+
+# Rubin-style pooling: average for Estimate, SE, t-value; median for p-value
+est_pooled <- rowMeans(est_mat)
+se_pooled  <- rowMeans(se_mat)
+t_pooled   <- rowMeans(t_mat)
+p_pooled_p <- apply(p_mat_p, 1, median)
+
+# Assemble final dataframe
+pooled_parametric <- data.frame(
+  Term = p_term_names,
+  Estimate = round(est_pooled, 4),
+  `Std. Error` = round(se_pooled, 4),
+  `t value` = round(t_pooled, 3),
+  `P-value` = signif(p_pooled_p, 3)
+)
+
+# Print nicely
+pander(pooled_parametric, row.names = FALSE)
+```
+
+
+```{r, echo=FALSE}
+pred_matrix <- sapply(gam_fits, function(model) {
+  predict(model, newdata = test_data)
+})
+```
+
+```{r, echo=FALSE}
+pred_ci <- predict(gam_fits[[1]], newdata = test_data, se.fit = TRUE)
+fit <- pred_ci$fit               # predicted log_crime
+se <- pred_ci$se.fit             # standard error of fit
+
+lower_log_conf <- fit - 1.96 * se
+upper_log_conf <- fit + 1.96 * se
+
+sigma <- sqrt(mean(resid(gam_fits[[1]])^2))  # residual standard deviation
+lower_log_pred <- fit - 1.96 * sqrt(se^2 + sigma^2)
+upper_log_pred <- fit + 1.96 * sqrt(se^2 + sigma^2)
+```
+
+```{r, echo=FALSE}
+# Predictions from representative model
+pred_crime <- exp(fit) - 0.01
+
+upper_conf <- pmin(exp(upper_log_conf) - 0.01, 1)
+upper_pred <- pmin(exp(upper_log_pred) - 0.01, 1)
+
+lower_conf <- pmax(exp(lower_log_conf) - 0.01, 0)
+lower_pred <- pmax(exp(lower_log_pred) - 0.01, 0)
+```
+
+```{r, echo=FALSE}
+pooled_log_pred <- rowMeans(pred_matrix)
+pooled_pred_crime <- exp(pooled_log_pred) - 0.01
+true_crime <- test_data$ViolentCrimesPerPop
+```
+
+```{r, echo=FALSE}
+interval_table <- data.frame(
+  True = round(test_data$ViolentCrimesPerPop, 2),
+  Pooled_Predicted = round(pooled_pred_crime, 2),  # your averaged prediction
+  CI_Lower = round(lower_conf, 2),
+  CI_Upper = round(upper_conf, 2),
+  PI_Lower = round(lower_pred, 2),
+  PI_Upper = round(upper_pred, 2)
+)
+
+pander(head(interval_table,4))
+```
+
+```{r, echo=FALSE}
+
+comparison <- data.frame(
+  True = round(test_data$ViolentCrimesPerPop, 2),
+  Predicted = round(pooled_pred_crime, 2)
+)
+
+rmse <- sqrt(mean((comparison$Predicted - comparison$True)^2))
+
+# MAE
+mae <- mean(abs(comparison$Predicted - comparison$True))
+
+# R²
+ss_res <- sum((comparison$True - comparison$Predicted)^2)
+ss_tot <- sum((comparison$True - mean(comparison$True))^2)
+r_squared <- 1 - ss_res / ss_tot
+
+performance_table <- data.frame(
+  Metric = c("RMSE", "MAE", "R-squared"),
+  Value = round(c(rmse, mae, r_squared), 4)
+)
+
+pander(performance_table, caption = "Model Performance Metrics")
+```
+```{r, echo=FALSE}
+ggplot(comparison, aes(x = True, y = Predicted)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Predicted vs Actual Violent Crime Rates",
+       x = "Actual ViolentCrimesPerPop",
+       y = "Predicted ViolentCrimesPerPop") +
+  theme_minimal()
+```
+
+
+
