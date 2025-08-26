@@ -23,8 +23,6 @@ The analysis focuses on:
 -   Identifying key socio-economic and housing factors associated with
     crime.
 
-![](results/figures/data_overview.png)
-
 ------------------------------------------------------------------------
 
 ## 📊 Dataset
@@ -33,7 +31,7 @@ The analysis focuses on:
 -   **Variables**: 67 predictors + 1 target (violent crime rate)  
 -   **Target**: `ViolentCrimesPerPop` (per capita violent crimes)
 
-![](results/figures/distribution_crime.png)
+![](figures/ResponseVarDist.png)
 
 Predictors include:
 
