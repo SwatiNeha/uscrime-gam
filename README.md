@@ -85,6 +85,8 @@ Predictors include:
     -   **Urbanization × Density × Transit**: transit protective in
         low-urban areas, less effective in dense cores.
 
+**Below are example plots: green shows low crime rate, yellow shows medium and red shows high crime rate.**
+
   <p align="center">
   <img src="figures/Q3.png" width="500">
   </p> 
